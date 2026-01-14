@@ -78,3 +78,4 @@ def chat(req: ChatRequest):
         "reply": reply,
         "model_used": model
     }
+
