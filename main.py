@@ -4,10 +4,10 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 
-# ================== CLIENT ==================
+# ================= CLIENT =================
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ================== APP =====================
+# ================= APP ====================
 app = FastAPI()
 
 app.add_middleware(
@@ -17,54 +17,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================== MODELS ==================
-PRIMARY_MODEL = "openai/gpt-oss-120b"
-FAST_MODEL = "llama-3.3-70b-versatile"
-REASON_MODEL = "qwen/qwen3-32b"
-GUARD_MODEL = "meta-llama/llama-guard-4-12b"
+# ================= MODEL REGISTRY =========
+MODEL_NICKNAMES = {
+    "jarvis": "openai/gpt-oss-120b",
+    "friday": "llama-3.3-70b-versatile",
+    "vision": "qwen/qwen3-32b",
+    "atlas": "openai/gpt-oss-20b",
+    "kimi": "moonshotai/kimi-k2-instruct",
+    "kimi-pro": "moonshotai/kimi-k2-instruct-0905",
+    "maverick": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "scout": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "swift": "llama-3.1-8b-instant",
+    "allam": "allam-2-7b",
+    "compound": "groq/compound-mini"
+}
 
-# ================== SCHEMA ==================
+SAFETY_MODELS = {
+    "guardian": "meta-llama/llama-guard-4-12b",
+    "safeguard": "openai/gpt-oss-safeguard-20b"
+}
+
+# ================= SCHEMA =================
 class ChatRequest(BaseModel):
     message: str
-    mode: str | None = "auto"
+    model: str = "friday"   # nickname
     system: str | None = "You are a helpful AI assistant."
+    guard: bool | None = False
 
-# ================== SAFETY ==================
+# ================= SAFETY =================
 def safety_check(text: str) -> bool:
     result = client.chat.completions.create(
-        model=GUARD_MODEL,
+        model=SAFETY_MODELS["guardian"],
         messages=[{"role": "user", "content": text}]
     )
     output = result.choices[0].message.content.lower()
     return "unsafe" not in output
 
-# ================== ROUTER ==================
-def choose_model(msg: str, mode: str) -> str:
-    if mode == "fast":
-        return FAST_MODEL
-    if mode == "reason":
-        return REASON_MODEL
-    if mode == "power":
-        return PRIMARY_MODEL
-
-    # AUTO MODE
-    if len(msg) > 400:
-        return PRIMARY_MODEL
-    if any(k in msg.lower() for k in ["math", "calculate", "prove", "logic"]):
-        return REASON_MODEL
-    return FAST_MODEL
-
-# ================== CHAT ====================
+# ================= CHAT ===================
 @app.post("/chat")
 def chat(req: ChatRequest):
 
-    if not safety_check(req.message):
-        return {"reply": "⚠️ Message blocked by safety system."}
+    if req.model not in MODEL_NICKNAMES:
+        return {
+            "reply": f"❌ Unknown model nickname: {req.model}",
+            "available_models": list(MODEL_NICKNAMES.keys())
+        }
 
-    model = choose_model(req.message, req.mode)
+    if req.guard:
+        if not safety_check(req.message):
+            return {"reply": "⚠️ Blocked by safety system."}
+
+    model_name = MODEL_NICKNAMES[req.model]
 
     completion = client.chat.completions.create(
-        model=model,
+        model=model_name,
         messages=[
             {"role": "system", "content": req.system},
             {"role": "user", "content": req.message}
@@ -72,10 +78,8 @@ def chat(req: ChatRequest):
         temperature=0.7
     )
 
-    reply = completion.choices[0].message.content
-
     return {
-        "reply": reply,
-        "model_used": model
+        "reply": completion.choices[0].message.content,
+        "model_used": req.model
     }
 
