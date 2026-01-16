@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-groq
-pydantic
-supabase
 python-dotenv
+groq
+supabase
+pydantic
