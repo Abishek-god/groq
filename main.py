@@ -4,7 +4,7 @@ import asyncio
 import httpx
 from uuid import uuid4
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from supabase import create_client
 
 # =====================================================
-# ENV
+# ENVIRONMENT
 # =====================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -28,13 +28,13 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("WARNING: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set")
 
 # =====================================================
-# MODEL REGISTRY
+# MODEL REGISTRY (GROQ)
 # =====================================================
 CHAT_MODELS = {
     "jarvis": "openai/gpt-oss-120b",
     "friday": "llama-3.3-70b-versatile",
-    "vision": "qwen-2.5-32b",
-    "swift": "llama-3.1-8b-instant",
+    "vision": "llama-3.1-8b-instant",  # safe default
+    "swift": "openai/gpt-oss-20b",
     "compound": "groq/compound-mini"
 }
 
@@ -45,17 +45,19 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_REQUESTS_PER_MIN = 30
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = 2
+MEMORY_LIMIT = 12  # how many past messages to inject
 
 # =====================================================
-# APP SETUP
+# APP
 # =====================================================
-app = FastAPI(title="Quantum Forge AI Backend (GROQ)")
+app = FastAPI(title="Quantum Forge AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
+    allow_credentials=True
 )
 
 # =====================================================
@@ -81,17 +83,17 @@ def check_rate_limit(ip: str):
     rate_limit[ip].append(now)
 
 # =====================================================
-# MODELS
+# REQUEST MODEL
 # =====================================================
 class ChatRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     message: str
     model: str
     conversation_id: Optional[str] = None
     stream: bool = False
 
 # =====================================================
-# HEALTH CHECK
+# HEALTH
 # =====================================================
 @app.get("/health")
 async def health():
@@ -102,7 +104,58 @@ async def health():
     }
 
 # =====================================================
-# GROQ CALL WITH RETRY
+# SAFE SUPABASE LOGGING
+# =====================================================
+def safe_log(data: dict):
+    try:
+        if sb:
+            sb.table("chats").insert(data).execute()
+    except Exception as e:
+        print("Supabase log error:", e)
+
+# =====================================================
+# PROFILE FETCH
+# =====================================================
+def get_user_name(user_id: Optional[str]) -> str:
+    if not sb or not user_id:
+        return "User"
+
+    try:
+        result = sb.table("profiles") \
+            .select("name") \
+            .eq("id", user_id) \
+            .single() \
+            .execute()
+
+        if result.data and result.data.get("name"):
+            return result.data["name"]
+    except Exception as e:
+        print("Profile fetch error:", e)
+
+    return "User"
+
+# =====================================================
+# CONVERSATION MEMORY
+# =====================================================
+async def get_conversation_context(conversation_id: Optional[str], limit=MEMORY_LIMIT) -> List[dict]:
+    if not sb or not conversation_id:
+        return []
+
+    try:
+        result = sb.table("chats") \
+            .select("role,message") \
+            .eq("conversation_id", conversation_id) \
+            .order("created_at", desc=False) \
+            .limit(limit) \
+            .execute()
+
+        return result.data or []
+    except Exception as e:
+        print("Context fetch error:", e)
+        return []
+
+# =====================================================
+# GROQ CALL (RETRY)
 # =====================================================
 async def call_groq(payload):
     headers = {
@@ -116,13 +169,14 @@ async def call_groq(payload):
                 res = await client.post(GROQ_URL, headers=headers, json=payload)
                 res.raise_for_status()
                 return res.json()
-        except Exception:
+        except Exception as e:
             if attempt == RETRY_ATTEMPTS - 1:
+                print("GROQ error:", e)
                 raise HTTPException(status_code=502, detail="GROQ backend unavailable")
             await asyncio.sleep(RETRY_BACKOFF ** attempt)
 
 # =====================================================
-# GROQ STREAM HANDLER
+# GROQ STREAM
 # =====================================================
 async def stream_groq(payload):
     headers = {
@@ -144,28 +198,51 @@ async def chat(req: Request, body: ChatRequest):
     ip = req.client.host
     check_rate_limit(ip)
 
+    conversation_id = body.conversation_id or str(uuid4())
+    user_id = body.user_id or "anonymous"
+
     model_id = CHAT_MODELS.get(body.model, CHAT_MODELS["compound"])
+
+    # Fetch user name
+    user_name = get_user_name(user_id)
+
+    # Log user message
+    safe_log({
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "role": "user",
+        "message": body.message
+    })
+
+    # Load memory
+    history = await get_conversation_context(conversation_id)
+
+    # Build messages
+    messages = [
+        {
+            "role": "system",
+            "content": f"You are a helpful AI assistant. The user's name is {user_name}. "
+                       "You can remember and reference earlier messages in this conversation."
+        }
+    ]
+
+    for msg in history:
+        messages.append({
+            "role": msg["role"],
+            "content": msg["message"]
+        })
+
+    messages.append({
+        "role": "user",
+        "content": body.message
+    })
 
     payload = {
         "model": model_id,
-        "messages": [
-            {"role": "system", "content": f"You are {body.model}, an AI assistant."},
-            {"role": "user", "content": body.message}
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "stream": body.stream
     }
-
-    conversation_id = body.conversation_id or str(uuid4())
-
-    # Log user message
-    if sb:
-        sb.table("chats").insert({
-            "user_id": body.user_id,
-            "conversation_id": conversation_id,
-            "role": "user",
-            "message": body.message
-        }).execute()
 
     # STREAM MODE
     if body.stream:
@@ -178,14 +255,13 @@ async def chat(req: Request, body: ChatRequest):
     result = await call_groq(payload)
     reply = result["choices"][0]["message"]["content"]
 
-    # Log AI message
-    if sb:
-        sb.table("chats").insert({
-            "user_id": body.user_id,
-            "conversation_id": conversation_id,
-            "role": "ai",
-            "message": reply
-        }).execute()
+    # Log AI reply
+    safe_log({
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "role": "ai",
+        "message": reply
+    })
 
     return JSONResponse({
         "response": reply,
